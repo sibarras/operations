@@ -4,6 +4,7 @@ import pandas as pd
 import random
 from sqlite3 import connect
 from pathlib import Path
+from matplotlib import pyplot as plt
 
 
 class Capacitor:
@@ -18,9 +19,6 @@ class Capacitor:
 class Genoma:
     def __init__(self, combination: list[Capacitor]) -> None:
         self.combination = combination
-    
-    def __repr__(self) -> str:
-        return str(self.combination)
 
 
 async def aiter(iterable: list, slice: int = None) -> list:
@@ -66,50 +64,66 @@ async def map_id(gen: Genoma) -> list[str]:
 
 async def fitness(gen: Genoma) -> float:
     tot_caps = await map_capacitance(gen)
+    groups_dev = sum([await standard_deviation(group) async for group in aiter(np.array(tot_caps), slice=9)])
     parallel = [await parallel_reduction(caps) async for caps in aiter(np.array(tot_caps), slice=9)]
     series = [await series_reduction(groups) async for groups in aiter(np.array(parallel), slice=6)]
-    return await standard_deviation(series)
+    return await standard_deviation(series) + await standard_deviation(np.array(parallel)) + groups_dev
 
 async def df_to_cap_list(df: pd.DataFrame) -> list[Capacitor]:
     assert set(df.columns).issuperset(["CAPACITANCIA ", "N° DE SERIE"])
     valid = df.loc[df['CAPACITANCIA '].notna()]
     return valid.apply(lambda s: Capacitor(s["N° DE SERIE"], s["CAPACITANCIA "]), axis=1).to_numpy().tolist()
 
+async def top_genomas(past_generation: list[Genoma], top_len: int) -> list[Genoma]:
+    fitness_tuple_calculations = [(await fitness(gen), gen) async for gen in aiter(past_generation)]
+    genomas = [gen for _, gen in sorted(fitness_tuple_calculations, key=lambda v:v[0])]
+    return genomas[:top_len]
+
 async def random_genoma(capacitor_options: list[Capacitor], genoma_length: int) -> Genoma:
     return Genoma(random.sample(capacitor_options, k=genoma_length))
 
-async def random_generation(capacitor_options: list[Capacitor], generation_length: int, genoma_lenth: int) -> list[Genoma]:
-    return [await random_genoma(capacitor_options, genoma_lenth) async for _ in aiter(range(generation_length))]
+async def random_genomas(capacitor_options: list[Capacitor], rand_len: int, genoma_len: int) -> list[Genoma]:
+    return [await random_genoma(capacitor_options, genoma_len) async for _ in aiter(range(rand_len))]
 
 async def crossover_genoma(gen1: Genoma, gen2: Genoma) -> Genoma:
-    # verificar si el orden importa. Si async for cambia el orden o no...
     return Genoma([g1 if random.getrandbits(1) == 1 else g2 async for g1, g2 in aiter(zip(gen1.combination, gen2.combination))])
+
+async def crossover_genomas(top_genomas: list[Genoma], cross_len: int) -> list[Genoma]:
+    return [await crossover_genoma(g1, g2) async for g1, g2 in aiter(zip(random.choices(top_genomas, k=cross_len), random.choices(top_genomas, k=cross_len)))]
 
 async def mutation_genoma(gen: Genoma, capacitor_options: list[Capacitor]) -> Genoma:
     index = random.randint(0, len(gen.combination) - 1)
     return Genoma([prev if n == index else random.choice(capacitor_options) async for n, prev in aiter(enumerate(gen.combination))])
+
+async def mutation_genomas(top_genomas: list[Genoma], capacitor_options: list[Genoma], mut_len: int) -> list[Genoma]:
+    return [await mutation_genoma(gen, capacitor_options) async for gen in aiter(random.choices(top_genomas, k=mut_len))]
 
 async def shuffle_genoma(gen: Genoma) -> Genoma:
     comb = gen.combination.copy()
     random.shuffle(comb)
     return Genoma(comb)
 
-async def update_generation(past_generation: list[Genoma], capacitor_options: list[Capacitor], gen_len: int, top_len: int, rand_len: int, cross_len: int, mut_len: int, shuff_len: int) -> list[Genoma]:
-    top_genomas = sorted(past_generation, key = lambda g: await fitness(g))[:top_len] # problema con el async aqui
-    mutated_genomas = [await mutation_genoma(gen, capacitor_options) async for gen in aiter(random.choices(top_genomas, k=mut_len))]
-    shuffled_genomas = [await shuffle_genoma(gen) async for gen in aiter(random.choices(top_genomas, k=shuff_len))]
-    random_genomas = [await random_genoma(capacitor_options, gen_len) async for _ in aiter(range(rand_len))]
-    crossovered_genomas = [await crossover_genoma(g1, g2) async for g1, g2 in aiter(zip(random.choices(top_genomas, k=cross_len), random.choices(top_genomas, k=cross_len)))]
-    return top_genomas + mutated_genomas + shuffled_genomas + random_genomas + crossovered_genomas
+async def shuffle_genomas(top_genomas: list[Genoma], shuff_len: int) -> list[Genoma]:
+    return [await shuffle_genoma(gen) async for gen in aiter(random.choices(top_genomas, k=shuff_len))]
 
-async def test():
+async def update_generation(top_genomas: list[Genoma], capacitor_options: list[Capacitor], genoma_len: int, rand_len: int, cross_len: int, mut_len: int, shuff_len: int) -> list[Genoma]:
+    
+    generations = await asyncio.gather(
+        mutation_genomas(top_genomas, capacitor_options, mut_len),
+        shuffle_genomas(top_genomas, shuff_len),
+        crossover_genomas(top_genomas, cross_len),
+        random_genomas(capacitor_options, rand_len, genoma_len)
+    )
+    return [gen async for generation in aiter(generations) async for gen in aiter(generation)] + top_genomas
+
+
+async def main():
     MAIN_FOLDER = Path(__file__).parent
     DB_FILE = MAIN_FOLDER / 'capacitors.db'
     EXCEL_FILE = MAIN_FOLDER / 'CAPACITORES.xlsx'
     RESULT_FILE = MAIN_FOLDER / 'resultados.xlsx'
 
     GENOMA_LENGTH = 3 * 6 * 9
-    OPTIONS_LENGTH = 3 * (3 * 6 * 9)
     GENERATION_LENGTH = 1000
     ITERATIONS = 1000
 
@@ -133,67 +147,31 @@ async def test():
             df = pd.read_sql_query("SELECT * FROM capacitors", conn, index_col='N°')
     
     capacitor_options = await df_to_cap_list(df)
-    generation = await random_generation(capacitor_options, GENERATION_LENGTH, GENOMA_LENGTH)
+    generation = await random_genomas(capacitor_options, GENERATION_LENGTH, GENOMA_LENGTH)
     best_fitness: list[Genoma] = []
+    
 
-    []
+    count = 0
+    while count < 100:
+        # print("complete gens:", [await fitness(gen) for gen in generation])
+        top_results = await top_genomas(generation, BEST_GENOMAS_LENGTH)
+        # print("top gens:", [await fitness(gen) for gen in top_results])
+        best_fitness.append(await fitness(top_results[0]))
+        if len(best_fitness)>2 and best_fitness[-2] == best_fitness[-1]:
+            count += 1
+        else: count = 0
+        print("geneation", len(best_fitness), "->", best_fitness[-1])
+        generation = await update_generation(top_results, capacitor_options, GENOMA_LENGTH, RANDOM_LENGTH, CROSSOVER_LENGTH, MUTATION_LENGTH, SHUFFLE_LENGTH)
 
-    cap1 = Capacitor(1, 50)
-    cap2 = Capacitor(2, 40)
-    cap3 = Capacitor(3, 60)
-    cap4 = Capacitor(4, 20)
-    cap5 = Capacitor(5, 70)
-
-    genoma1 = Genoma([cap1 async for _ in aiter(range(3*6*9))])
-    genoma2 = Genoma([cap3 async for _ in aiter(range(3*6*9))])
-
-    print("calling mapping functions")
-    cap1 = await map_capacitance(genoma1)
-    cap2 = await map_capacitance(genoma2)
-    print("mapping finished!")
-
-    print("calling mapping id")
-    id1 = await map_id(genoma1)
-    id2 = await map_id(genoma2)
-    print("mapping finished!")
-
-    print("calling fitness")
-    fit1 = await fitness(genoma1)
-    fit2 = await fitness(genoma2)
-    print("fitness finished!")
-
-    print("calling random genoma")
-    gen1 = await random_genoma(capacitor_options, GENOMA_LENGTH)
-    gen2 = await random_genoma(capacitor_options, GENOMA_LENGTH)
-    print("random finished!")
-
-    print("calling mutated genoma")
-    gen1 = await mutation_genoma(gen1, capacitor_options)
-    print("mutation finished!")
-
-    print("calling shuffle genoma")
-    gen1 = await shuffle_genoma(genoma1)
-    print("shuffle finished!")
-
-    print("calling crossover genoma")
-    gen1 = await crossover_genoma(gen1, gen2)
-    print("crossover finished!")
-
-    print("Calling an generation iteration")
-    generation = await update_generation(
-        generation,
-        capacitor_options,
-        GENERATION_LENGTH,
-        BEST_GENOMAS_LENGTH,
-        RANDOM_LENGTH,
-        CROSSOVER_LENGTH,
-        MUTATION_LENGTH,
-        SHUFFLE_LENGTH
-    )
-    print("new generation finished")
-
-
-
+    best_combination = generation[0].combination
+    cols = list(best_combination[0].__dict__.keys())
+    data = [tuple(c.__dict__.values()) for c in best_combination]
+    result = pd.DataFrame(data, columns=cols)
+    result.to_excel(RESULT_FILE, "results")
+    print(result)
+    
+    plt.plot(best_fitness)
+    plt.show()
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(main())
